@@ -68,3 +68,6 @@ frontend/.env*
 
 # dataconnect generated files
 .dataconnect
+
+# macOS specific files
+.DS_Store

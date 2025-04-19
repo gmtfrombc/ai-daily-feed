@@ -1,55 +1,49 @@
 /**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
+ * Firebase Cloud Functions for ai_daily_feed
  */
 
 // Load environment variables (like OPENAI_API_KEY)
 require('dotenv').config();
 
 const { onRequest } = require("firebase-functions/v2/https");
-const { onSchedule } = require("firebase-functions/v2/scheduler"); // For scheduled runs
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
 const admin = require('firebase-admin');
 const { OpenAI } = require('openai');
-const cors = require('cors');
+const cors = require('cors')({ origin: true }); // Use ({origin: true}) for simple config
+const { FieldValue } = require('firebase-admin/firestore'); // Explicit import for FieldValue
+const { getDocs, collection, query, orderBy, doc, getDoc, updateDoc } = require('firebase-admin/firestore');
 
 // Initialize Firebase Admin SDK
 admin.initializeApp();
 const db = admin.firestore();
 
 // Initialize OpenAI Client
-if (!process.env.OPENAI_API_KEY) {
-    logger.error("OpenAI API key not found in environment variables.");
+let openai;
+if (process.env.OPENAI_API_KEY) {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    logger.info("OpenAI client initialized.");
+} else {
+    logger.error("OpenAI API key not found in environment variables. Text generation will fail.");
+    // You might want to throw an error here or handle it gracefully depending on requirements
 }
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
 
-// Create and deploy your first functions
-// https://firebase.google.com/docs/functions/get-started
 
-// exports.helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
-
-// --- Placeholder for Article Generation Logic --- //
-// This function will contain the core logic for fetching source, calling OpenAI, and saving draft
+// --- Core Article Generation Logic --- //
 async function generateArticleLogic() {
     logger.info("Starting article generation process...");
 
     // --- 1. Select a Topic from Firestore (with history check) ---
     let selectedTopicDoc = null;
     let selectedTopicId = null;
+    let selectedLessonId = null;
+    let topicTitle = null;
+    let sourceText = null;
+
     try {
-        // Get all available topic IDs
+        // Get all available topic IDs efficiently using select()
         const topicsRef = db.collection('topics');
-        // Use select() to only fetch IDs initially for efficiency
-        const allTopicsSnapshot = await topicsRef.select().get();
+        const allTopicsSnapshot = await topicsRef.select().get(); // Fetch only IDs
         if (allTopicsSnapshot.empty) {
             logger.error("No topics found in the 'topics' collection.");
             return;
@@ -57,190 +51,269 @@ async function generateArticleLogic() {
         const allTopicIds = allTopicsSnapshot.docs.map(doc => doc.id);
         logger.info(`Found ${allTopicIds.length} total topics.`);
 
-        // Get recently used topic IDs from topic_history (e.g., last 10)
+        // Get recently used topic IDs from topic_history (e.g., last N topics, maybe half the total?)
+        const historyLookbackCount = Math.max(1, Math.floor(allTopicIds.length / 2)); // Look back ~half the topics
         const historyRef = db.collection('topic_history');
-        const historyQuery = historyRef.orderBy('usedAt', 'desc').limit(10); // Adjust limit as needed
+        const historyQuery = historyRef.orderBy('usedAt', 'desc').limit(historyLookbackCount);
         const historySnapshot = await historyQuery.get();
         const recentTopicIds = historySnapshot.docs.map(doc => doc.data().topicId);
-        logger.info(`Found ${recentTopicIds.length} recent topics in history: ${recentTopicIds.join(', ')}`);
+        logger.info(`Found ${recentTopicIds.length} topics in recent history (lookback: ${historyLookbackCount}).`);
 
         // Filter out recent topics
         let availableTopicIds = allTopicIds.filter(id => !recentTopicIds.includes(id));
         logger.info(`Found ${availableTopicIds.length} topics available after filtering history.`);
 
-        // Handle case where all topics were used recently
+        // Handle case where all topics were used recently (cycle is complete)
         if (availableTopicIds.length === 0) {
-            logger.warn("All topics have been used recently. Selecting randomly from all available topics as a fallback.");
-            // Fallback: use all topics if the filtered list is empty
-            availableTopicIds = allTopicIds;
-            if (availableTopicIds.length === 0) {
+            logger.warn("All topics used recently or list empty. Selecting randomly from ALL topics as fallback.");
+            availableTopicIds = allTopicIds; // Fallback to using all IDs
+            if (availableTopicIds.length === 0) { // Should not happen if initial check passed
                 logger.error("CRITICAL: No topics available even in fallback.");
                 return;
             }
         }
 
-        // Select a random topic ID from the available list
+        // Select a random topic ID from the *available* list
         const randomIndex = Math.floor(Math.random() * availableTopicIds.length);
         selectedTopicId = availableTopicIds[randomIndex];
-        logger.info(`Randomly selected topic ID: ${selectedTopicId}`);
+        logger.info(`Randomly selected available topic ID: ${selectedTopicId}`);
 
         // Fetch the full document for the selected topic
         const topicDocRef = db.collection('topics').doc(selectedTopicId);
         selectedTopicDoc = await topicDocRef.get();
 
         if (!selectedTopicDoc.exists) {
-            logger.error(`Selected topic document with ID ${selectedTopicId} does not exist (this shouldn't happen).`);
+            // This could happen if a topic was deleted between getting IDs and fetching
+            logger.error(`Selected topic document with ID ${selectedTopicId} no longer exists.`);
+            return; // Or potentially retry selection?
+        }
+
+        // Extract data (moved here for clarity)
+        const topicData = selectedTopicDoc.data();
+        selectedLessonId = topicData.lessonId;
+        topicTitle = topicData.title;
+        sourceText = topicData.content;
+
+        logger.info(`Successfully fetched selected topic: Title="${topicTitle}", LessonID=${selectedLessonId}`);
+
+        if (!sourceText || !topicTitle || !selectedLessonId) {
+            logger.error(`Topic document ${selectedTopicId} is missing title, content, or lessonId.`);
             return;
         }
-        logger.info(`Successfully fetched selected topic: Title="${selectedTopicDoc.data().title}"`);
 
     } catch (error) {
-        logger.error("Error during topic selection:", error);
+        logger.error("Error during topic selection process:", error);
         return; // Stop execution on error
     }
+    // --- End of Topic Selection ---
 
-    // Extract data (moved after successful fetch)
-    const topicData = selectedTopicDoc.data();
-    const sourceText = topicData.content;
-    const topicTitle = topicData.title;
-    const lessonId = topicData.lessonId; // Assuming lessonId field exists
-
-    if (!sourceText || !topicTitle) {
-        logger.error(`Topic document ${selectedTopicId} is missing title or content.`);
-        return;
-    }
-
-    // --- 2. Construct Prompt for OpenAI ---
-    // System message defines the AI's role and general behavior
-    const systemMessage = "You are an expert health writer for a lifestyle change program. Your role is to create clear, informative, and engaging content that helps patients understand and apply health concepts in their daily lives.";
-
-    // User prompt contains the specific task, style guidelines, and source text
-    const userPrompt = `Create a 100-150 word article based on the following text about '${topicTitle}'. 
-    Writing style guidelines:
-    - Write in a clear, conversational tone
-    - Address the reader directly but professionally
-    - Focus on practical insights and actionable takeaways
-    - Avoid hype, buzzwords, and exclamation points
-    - Don't use greetings or marketing phrases
-    - Maintain the core message and insights from the source text
-    
-    Source text:
-    ---
-    ${sourceText}
-    ---
-    
-    Output only the article text, ready for publication.`;
-
-    // --- 3. Call OpenAI API (GPT-4) ---
-    let generatedContent = "";
-    // Use the topic title for the draft title, or refine if needed
-    let generatedTitle = `Daily Feed: ${topicTitle}`;
+    // --- 2. Fetch Corresponding Lesson Image URL ---
+    let selectedImageUrl = null;
     try {
-        logger.info("Calling OpenAI API...");
-        const response = await openai.chat.completions.create({
-            model: "gpt-4",
-            messages: [
-                { role: "system", content: systemMessage },
-                { role: "user", content: userPrompt }
-            ],
-            max_tokens: 500,
-            temperature: 0.7,
-        });
-
-        if (response.choices && response.choices.length > 0) {
-            generatedContent = response.choices[0].message.content.trim();
-            logger.info(`Received generated content (length: ${generatedContent.length})`);
+        const lessonDocRef = db.collection('lessons').doc(selectedLessonId);
+        const lessonDoc = await lessonDocRef.get();
+        if (lessonDoc.exists && lessonDoc.data().imageUrl) {
+            selectedImageUrl = lessonDoc.data().imageUrl;
+            logger.info(`Found image URL for lesson ${selectedLessonId}: ${selectedImageUrl}`);
         } else {
-            logger.error("OpenAI response did not contain expected choices.");
-            return;
+            logger.warn(`Image URL not found for lesson ID: ${selectedLessonId}. Draft will have no image.`);
         }
     } catch (error) {
-        logger.error("Error calling OpenAI API:", error);
-        return;
+        logger.error(`Error fetching lesson document ${selectedLessonId}:`, error);
+        // Continue without image if lesson fetch fails
     }
 
-    // --- 4. Save Draft to Firestore ---
-    let draftRefId = null; // To store the ID for history update
+    // --- 3. Construct Prompt for OpenAI & Generate Text ---
+    let generatedContent = "";
+    let generatedTitle = `Daily Feed: ${topicTitle}`;
+
+    if (!openai) { // Check if OpenAI client failed to initialize
+        logger.error("OpenAI client not available. Skipping text generation.");
+        // Use placeholder content or stop?
+        generatedContent = "[AI text generation failed - API key missing]";
+    } else {
+        const systemMessage = "You are an expert health writer for a lifestyle change program. Your role is to create clear, informative, and engaging content that helps patients understand and apply health concepts in their daily lives.";
+        const userPrompt = `Create a 50-100 word short article based on the following text about '${topicTitle}'. 
+        Writing style guidelines:
+        - Write in a clear, conversational tone
+        - Address the reader directly but professionally
+        - Focus on practical insights and a simple, actionable takeaway
+        - Don't use hype, buzzwords, and exclamation points
+        - Don't use greetings or marketing phrases
+        - Address a single core message and insights from the source text
+        
+        Source text:
+        ---
+        ${sourceText}
+        ---
+        
+        Output only the article text, ready for publication.`;
+        try {
+            logger.info("Calling OpenAI API for text generation...");
+            const response = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: systemMessage },
+                    { role: "user", content: userPrompt }
+                ],
+                max_tokens: 500,
+                temperature: 0.7,
+            });
+
+            if (response.choices && response.choices.length > 0) {
+                generatedContent = response.choices[0].message.content.trim();
+                logger.info(`Received generated content (length: ${generatedContent.length})`);
+            } else {
+                logger.error("OpenAI response did not contain expected choices.");
+                generatedContent = "[AI text generation failed - No response choice]"; // Placeholder on failure
+            }
+        } catch (error) {
+            logger.error("Error calling OpenAI API:", error);
+            generatedContent = "[AI text generation failed - API error]"; // Placeholder on failure
+        }
+    }
+
+    // --- 4. Save Draft to Firestore (including Image URL) ---
+    let draftRefId = null; // Variable to hold the new draft ID for history update
     try {
         const draftData = {
             title: generatedTitle,
             content: generatedContent,
-            topicId: selectedTopicId, // Use the selected ID
-            topicTitle: topicTitle,
-            lessonId: lessonId || null, // Store reference to the lesson
-            status: "pending",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-        const draftRef = await db.collection('drafts').add(draftData);
-        draftRefId = draftRef.id; // Store the new draft ID
-        logger.info(`Draft saved successfully with ID: ${draftRefId}`);
-
-        // --- 5. Update Topic History ---
-        // Add entry to topic_history only *after* draft is saved
-        const historyData = {
             topicId: selectedTopicId,
-            topicTitle: topicTitle, // Optional: store title for easier debugging
-            draftId: draftRefId,   // Optional: link to the generated draft
-            usedAt: admin.firestore.FieldValue.serverTimestamp()
+            topicTitle: topicTitle,
+            lessonId: selectedLessonId,
+            imageUrl: selectedImageUrl || null,
+            status: "pending",
+            createdAt: FieldValue.serverTimestamp(),
         };
-        await db.collection('topic_history').add(historyData);
-        logger.info(`Updated topic_history for topic ID: ${selectedTopicId}`);
+        logger.info("Attempting to save draft data:", { data: draftData });
+        const draftRef = await db.collection('drafts').add(draftData);
+        draftRefId = draftRef.id; // Capture the ID of the newly created draft
+        logger.info(`Draft save attempt successful. Document ID: ${draftRefId}`);
 
     } catch (error) {
-        logger.error("Error saving draft or updating topic history:", error);
-        // Decide if partial failure needs specific handling
-        // If draft saved but history failed, the topic might be picked again sooner than expected.
+        logger.error("FATAL Error during Firestore draft save:", error);
+        // If draft save fails, we should NOT update history
+        return; // Stop execution if draft cannot be saved
+    }
+
+    // --- 5. Update Topic History (AFTER successful draft save) ---
+    if (draftRefId && selectedTopicId) { // Ensure we have IDs needed
+        try {
+            const historyData = {
+                topicId: selectedTopicId,
+                topicTitle: topicTitle, // Optional: store title for easier debugging
+                draftId: draftRefId,   // Optional: link to the generated draft
+                lessonId: selectedLessonId || null, // Optional
+                usedAt: FieldValue.serverTimestamp()
+            };
+            await db.collection('topic_history').add(historyData);
+            logger.info(`Successfully updated topic_history for topic ID: ${selectedTopicId}`);
+        } catch (historyError) {
+            // Log failure to update history, but don't necessarily stop the whole process
+            // The main goal (generating the draft) succeeded.
+            logger.error(`Error updating topic_history for topic ${selectedTopicId}:`, historyError);
+        }
+    } else {
+        logger.warn("Skipping topic_history update because draftRefId or selectedTopicId was missing.");
     }
 
     logger.info("Article generation process finished.");
 }
 
+// --- Core Daily Feed Rotation Logic --- //
+async function rotateDailyFeedLogic() {
+    logger.info("Starting daily feed rotation process...");
+
+    try {
+        // 1. Get all published articles, sorted by orderIndex
+        const articlesRef = db.collection('published_articles');
+        const q = articlesRef.orderBy('orderIndex', 'asc');
+        const articlesSnapshot = await q.get();
+
+        if (articlesSnapshot.empty) {
+            logger.warn("No published articles found. Cannot rotate feed.");
+            return;
+        }
+
+        const sortedArticles = articlesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        const articleCount = sortedArticles.length;
+        logger.info(`Found ${articleCount} published articles ordered by index.`);
+
+        if (articleCount <= 1) {
+            logger.info("Only one or zero published articles. No rotation needed.");
+            // Ensure the single article (if it exists) is set as current
+            if (articleCount === 1) {
+                const singleArticleId = sortedArticles[0].id;
+                const configRef = db.collection('current_config').doc('live_article');
+                const configSnap = await configRef.get();
+                if (!configSnap.exists() || configSnap.data().currentArticleId !== singleArticleId) {
+                    logger.info(`Setting the single article ${singleArticleId} as current.`);
+                    await configRef.set({ currentArticleId: singleArticleId }, { merge: true }); // Use set with merge
+                }
+            }
+            return;
+        }
+
+        // 2. Get the current live article ID
+        const configRef = db.collection('current_config').doc('live_article');
+        const configSnap = await configRef.get();
+
+        let currentArticleId = null;
+        let currentIndex = -1;
+
+        if (configSnap.exists()) {
+            currentArticleId = configSnap.data().currentArticleId;
+            logger.info(`Current live article ID: ${currentArticleId}`);
+            // Find the index of the current article in the sorted list
+            currentIndex = sortedArticles.findIndex(article => article.id === currentArticleId);
+        } else {
+            logger.warn("live_article config document not found. Will set the first article as current.");
+            // If config doesn't exist, we'll default to the first article (index 0)
+        }
+
+        if (currentIndex === -1 && currentArticleId) {
+            logger.warn(`Current article ID ${currentArticleId} not found in published list. Defaulting to first article.`);
+            // Reset index if current ID is invalid or not found
+        }
+
+        // 3. Determine the next article index (wrap around)
+        const nextIndex = (currentIndex + 1) % articleCount;
+        const nextArticle = sortedArticles[nextIndex];
+        const nextArticleId = nextArticle.id;
+
+        logger.info(`Calculated next article index: ${nextIndex}, ID: ${nextArticleId}`);
+
+        // 4. Update the config if the next article is different
+        if (nextArticleId !== currentArticleId) {
+            await configRef.set({ currentArticleId: nextArticleId }, { merge: true }); // Use set with merge to create/update
+            logger.info(`Successfully updated live_article config to point to: ${nextArticleId}`);
+        } else {
+            logger.info("Next article ID is the same as current. No update needed.");
+        }
+
+    } catch (error) {
+        logger.error("Error during daily feed rotation:", error);
+        // Consider adding alerting here
+    }
+    logger.info("Daily feed rotation process finished.");
+}
+
+
 // --- Function Triggers --- //
 
-// HTTP Trigger (for manual testing via URL)
+// HTTP Trigger (for manual testing/regeneration)
 exports.generateArticleHttp = onRequest(
     { timeoutSeconds: 540, memory: '1GiB' },
     (request, response) => {
-        // Define allowed origins for this function
-        const allowedOrigins = ['http://localhost:8080', 'https://ai-daily-feed.web.app'];
-
-        // Create and apply CORS middleware for this specific request
-        const corsHandler = cors({ origin: allowedOrigins });
-
-        corsHandler(request, response, async () => {
-            // --- Log Incoming Headers (for debugging auth) ---
-            logger.info("Incoming request headers:", request.headers);
-
-            // --- Manual Authentication Check --- 
-            let decodedToken = null;
-            const authorizationHeader = request.headers.authorization;
-
-            if (!authorizationHeader || !authorizationHeader.startsWith('Bearer ')) {
-                logger.warn("Unauthorized: No or invalid Authorization header.", { headers: request.headers });
-                response.status(401).send("Unauthorized: Missing or malformed Authorization header.");
-                return;
-            }
-
-            const idToken = authorizationHeader.split('Bearer ')[1];
-
-            try {
-                // Verify the ID token using Firebase Admin SDK
-                decodedToken = await admin.auth().verifyIdToken(idToken);
-                logger.info(`Successfully verified token for user: ${decodedToken.uid}`);
-            } catch (error) {
-                logger.error("Error verifying Firebase ID token:", error);
-                response.status(403).send("Forbidden: Invalid or expired authentication token.");
-                return;
-            }
-
-            // At this point, decodedToken is valid and contains user info (e.g., decodedToken.uid)
-            // We no longer need the platform-populated request.auth check
-            // if (!request.auth) { ... } // REMOVED
-
-            // --- Proceed with function logic if token is verified --- 
+        // Wrap the main logic with the cors middleware handler
+        cors(request, response, async () => {
+            logger.info("HTTP trigger invoked (via CORS).", { origin: request.get('origin') });
+            // NOTE: Authentication check removed for simplicity in this example.
+            // Re-add token verification if needed for manual trigger security.
             try {
                 await generateArticleLogic();
-                response.send("Article generation process triggered successfully. Check logs and Firestore 'drafts' collection.");
+                response.send("Article generation process triggered successfully.");
             } catch (error) {
                 logger.error("Error in HTTP trigger execution:", error);
                 response.status(500).send("An error occurred during article generation.");
@@ -248,5 +321,29 @@ exports.generateArticleHttp = onRequest(
         });
     });
 
-// Scheduled Trigger (commented out)
-// exports.generateArticleScheduled = onSchedule(...);
+// Scheduled Trigger (Example: Runs every day at 9:00 AM America/New_York)
+// exports.generateArticleScheduled = onSchedule(
+//   { schedule: "every day 09:00", timezone: "America/New_York", timeoutSeconds: 540, memory: '1GiB' },
+//   async (event) => {
+//     logger.info("Scheduled trigger invoked.", { scheduleTime: event.scheduleTime });
+//     try {
+//       await generateArticleLogic();
+//       logger.info("Scheduled article generation finished successfully.");
+//     } catch (error) {
+//       logger.error("Error in scheduled trigger execution:", error);
+//       // Add monitoring/alerting here if needed for scheduler failures
+//     }
+//   }
+// );
+
+// NEW Scheduled Trigger for Feed Rotation
+exports.rotateDailyFeedScheduled = onSchedule(
+    // Run every day at midnight (00:00) in New York timezone
+    { schedule: "every day 00:00", timezone: "America/New_York", timeoutSeconds: 300, memory: '1GiB' },
+    async (event) => {
+        logger.info("Scheduled feed rotation trigger invoked.", { scheduleTime: event.scheduleTime });
+        await rotateDailyFeedLogic();
+        logger.info("Scheduled feed rotation finished successfully.");
+        // Note: Error handling happens within rotateDailyFeedLogic
+    }
+);

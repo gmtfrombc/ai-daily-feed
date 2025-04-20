@@ -305,17 +305,48 @@ async function rotateDailyFeedLogic() {
 // HTTP Trigger (for manual testing/regeneration)
 exports.generateArticleHttp = onRequest(
     { timeoutSeconds: 540, memory: '1GiB' },
-    (request, response) => {
-        // Wrap the main logic with the cors middleware handler
+    async (request, response) => { // Make the main handler async
+        // Handle CORS first
         cors(request, response, async () => {
             logger.info("HTTP trigger invoked (via CORS).", { origin: request.get('origin') });
-            // NOTE: Authentication check removed for simplicity in this example.
-            // Re-add token verification if needed for manual trigger security.
+
+            // --- Authentication Check ---
+            const authorizationHeader = request.headers.authorization || '';
+            if (!authorizationHeader.startsWith('Bearer ')) {
+                logger.warn('Unauthorized: No Bearer token provided.');
+                response.status(403).send('Unauthorized: Missing authorization token.');
+                return;
+            }
+
+            const idToken = authorizationHeader.split('Bearer ')[1];
+            let decodedToken;
             try {
+                decodedToken = await admin.auth().verifyIdToken(idToken);
+                logger.info("ID Token verified successfully for UID:", decodedToken.uid);
+
+                // --- Authorization Check (Optional but Recommended) ---
+                // Check if the user has the isAdmin claim
+                if (decodedToken.isAdmin !== true) {
+                    logger.warn(`Forbidden: User ${decodedToken.uid} is not an admin.`);
+                    response.status(403).send('Forbidden: User does not have admin privileges.');
+                    return;
+                }
+                // --- End Authorization Check ---
+
+            } catch (error) {
+                logger.error('Error verifying ID token:', error);
+                response.status(403).send('Unauthorized: Invalid or expired token.');
+                return;
+            }
+            // --- End Authentication Check ---
+
+            // --- Proceed only if authenticated (and authorized) ---
+            try {
+                logger.info(`Admin user ${decodedToken.uid} triggering generation.`); // Log admin action
                 await generateArticleLogic();
                 response.send("Article generation process triggered successfully.");
             } catch (error) {
-                logger.error("Error in HTTP trigger execution:", error);
+                logger.error("Error in HTTP trigger execution after auth:", error);
                 response.status(500).send("An error occurred during article generation.");
             }
         });

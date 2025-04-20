@@ -6,7 +6,8 @@ service cloud.firestore {
     // Drafts: Only allow authenticated users to read/write/update/delete drafts
     // Consider adding status checks if needed (e.g., only allow update if status is 'pending')
     match /drafts/{draftId} {
-      allow read, write: if request.auth != null;
+      // Only allow admins to read/write drafts
+      allow read, write: if request.auth != null && request.auth.token.isAdmin == true;
       // allow create: if request.auth != null;
       // allow update, delete: if request.auth != null;
     }
@@ -14,17 +15,15 @@ service cloud.firestore {
     // Published Articles: Allow anyone to read, authenticated users can CUD
     match /published_articles/{articleId} {
       allow read: if true; // Anyone can read published articles
-      // Explicitly allow create, update, delete for authenticated users
-      allow create: if request.auth != null;
-      allow update: if request.auth != null;
-      allow delete: if request.auth != null; // We will need delete later
+      // Explicitly allow create, update, delete for admin users only
+      allow create, update, delete: if request.auth != null && request.auth.token.isAdmin == true;
     }
 
     // Current Config: Allow anyone to read, allow authenticated users to update
     match /current_config/live_article {
       allow read: if true;
-      // Allow update only for authenticated users (admin)
-      allow update: if request.auth != null;
+      // Allow update only for admin users
+      allow update: if request.auth != null && request.auth.token.isAdmin == true;
       // Explicitly deny create/delete for safety
       allow create, delete: if false;
     }
